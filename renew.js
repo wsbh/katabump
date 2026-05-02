@@ -265,6 +265,64 @@ async function attemptTurnstileCdp(page) {
     return false;
 }
 
+/**
+ * ALTCHA captcha bypass: finds the <altcha-widget> web component,
+ * pierces its Shadow DOM, and clicks the "I'm not a robot" checkbox.
+ */
+async function attemptAltchaClick(page) {
+    try {
+        const clicked = await page.evaluate(() => {
+            // ALTCHA renders as a custom element <altcha-widget> in the main DOM
+            const widget = document.querySelector('altcha-widget');
+            if (!widget) return false;
+            const sr = widget.shadowRoot;
+            if (!sr) return false;
+            const checkbox = sr.querySelector('input[type="checkbox"]');
+            if (!checkbox) return false;
+            // Don't re-click if already checked
+            if (checkbox.checked) return 'already';
+            checkbox.click();
+            return true;
+        });
+        if (clicked === 'already') {
+            console.log('   >> ALTCHA checkbox already checked.');
+            return true;
+        }
+        if (clicked) {
+            console.log('   >> ALTCHA checkbox clicked via Shadow DOM.');
+            return true;
+        }
+    } catch (e) {
+        // ignore
+    }
+    return false;
+}
+
+/**
+ * Waits for ALTCHA proof-of-work to finish.
+ * ALTCHA sets widget.value to the encoded payload when done,
+ * and the widget's `state` attribute becomes "verified".
+ */
+async function waitForAltchaComplete(page, timeoutMs = 30000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const done = await page.evaluate(() => {
+                const widget = document.querySelector('altcha-widget');
+                if (!widget) return false;
+                const state = widget.getAttribute('state');
+                if (state === 'verified') return true;
+                // Fallback: check hidden input value
+                const hidden = widget.shadowRoot && widget.shadowRoot.querySelector('input[type="hidden"]');
+                return hidden && hidden.value && hidden.value.length > 0;
+            });
+            if (done) return true;
+        } catch (e) {}
+        await page.waitForTimeout(500);
+    }
+    return false;
+}
+
 (async () => {
     const users = getUsers();
     if (users.length === 0) {
@@ -463,37 +521,56 @@ async function attemptTurnstileCdp(page) {
                         if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
                     } catch (e) { }
 
-                    // B. 找 Turnstile (小重试)
-                    console.log('Checking for Turnstile (using CDP bypass)...');
-                    let cdpClickResult = false;
-                    for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                        cdpClickResult = await attemptTurnstileCdp(page);
-                        if (cdpClickResult) break;
-                        console.log(`   >> [Find Attempt ${findAttempt + 1}/30] Turnstile checkbox not found yet...`);
-                        await page.waitForTimeout(1000);
-                    }
+                    // B. Try ALTCHA first (site switched from Turnstile to ALTCHA)
+                    console.log('   >> Checking for ALTCHA captcha...');
+                    let captchaResolved = false;
 
-                    let isTurnstileSuccess = false;
-                    if (cdpClickResult) {
-                        console.log('   >> CDP Click active. Waiting 8s for Cloudflare check...');
-                        await page.waitForTimeout(8000);
+                    // Give the modal a moment to fully render the ALTCHA widget
+                    await page.waitForTimeout(1500);
+
+                    const altchaClicked = await attemptAltchaClick(page);
+                    if (altchaClicked) {
+                        console.log('   >> ALTCHA clicked. Waiting for proof-of-work computation (up to 30s)...');
+                        const altchaDone = await waitForAltchaComplete(page, 30000);
+                        if (altchaDone) {
+                            console.log('   >> ✅ ALTCHA proof-of-work completed!');
+                            captchaResolved = true;
+                        } else {
+                            console.log('   >> ⚠️ ALTCHA did not finish in time. Proceeding anyway...');
+                        }
                     } else {
-                        console.log('   >> Turnstile checkbox not confirmed after retries.');
+                        // Fallback: try Turnstile (in case site reverts or uses both)
+                        console.log('   >> ALTCHA widget not found. Falling back to Turnstile CDP bypass...');
+                        let cdpClickResult = false;
+                        for (let findAttempt = 0; findAttempt < 10; findAttempt++) {
+                            cdpClickResult = await attemptTurnstileCdp(page);
+                            if (cdpClickResult) break;
+                            console.log(`   >> [Find Attempt ${findAttempt + 1}/10] Captcha not found yet...`);
+                            await page.waitForTimeout(1000);
+                        }
+                        if (cdpClickResult) {
+                            console.log('   >> CDP Turnstile click sent. Waiting 8s...');
+                            await page.waitForTimeout(8000);
+                            captchaResolved = true;
+                        } else {
+                            console.log('   >> No captcha found. Proceeding anyway...');
+                        }
                     }
 
-                    // C. 检查 Success 标志
+                    // C. 检查 Success 标志 (Turnstile fallback check)
                     const frames = page.frames();
                     for (const f of frames) {
                         if (f.url().includes('cloudflare')) {
                             try {
                                 if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
                                     console.log('   >> Detected "Success!" in Turnstile iframe.');
-                                    isTurnstileSuccess = true;
+                                    captchaResolved = true;
                                     break;
                                 }
                             } catch (e) { }
                         }
                     }
+                    const isTurnstileSuccess = captchaResolved;
 
                     // D. 准备点击确认
                     const confirmBtn = modal.getByRole('button', { name: 'Renew' });
